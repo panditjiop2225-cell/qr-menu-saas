@@ -1,0 +1,18 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(node -e \"require\\('./routes/orders'\\)\")",
+      "Bash(node index.js)",
+      "Bash(curl -s -X PUT http://localhost:5000/api/orders/ORD-DEMO-001/status -H 'Content-Type: application/json' -d '{\"status\":\"confirmed\",\"updatedBy\":\"admin\"}')",
+      "Bash(python3 -c \"import sys,json; d=json.load\\(sys.stdin\\); print\\('status:', d.get\\('status'\\), '| history:', len\\(d.get\\('statusHistory',[]\\)\\)\\)\")",
+      "Bash(curl -s -X PUT http://localhost:5000/api/orders/ORD-DEMO-001/status -H 'Content-Type: application/json' -d '{\"status\":\"delivered\",\"updatedBy\":\"admin\"}')",
+      "Bash(python3 -c \"import sys,json; d=json.load\\(sys.stdin\\); print\\('error:', d.get\\('error'\\), '| allowed:', d.get\\('allowed'\\)\\)\")",
+      "Bash(curl -s -X PUT http://localhost:5000/api/orders/ORD-DEMO-004/status -H 'Content-Type: application/json' -d '{\"status\":\"preparing\",\"updatedBy\":\"admin\"}')",
+      "Bash(python3 -c \"import sys,json; d=json.load\\(sys.stdin\\); print\\('error:', d.get\\('error'\\)\\)\")",
+      "Bash(curl -s -X PUT http://localhost:5000/api/orders/ORD-DEMO-002/status -H 'Content-Type: application/json' -d '{\"status\":\"cancelled\",\"updatedBy\":\"admin\"}')",
+      "Bash(python3 -c \"import sys,json; d=json.load\\(sys.stdin\\); print\\('status:', d.get\\('status'\\)\\)\" kill %1)",
+      "Bash(npm run *)",
+      "Bash(netlify deploy *)"
+    ]
+  }
+}

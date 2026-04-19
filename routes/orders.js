@@ -3,14 +3,33 @@ const Razorpay = require('razorpay')
 const crypto   = require('crypto')
 
 const router = express.Router()
+const Order  = require('../models/Order')
 
-// In-memory order store (replace with DB in production)
-const orders = new Map()
+// ─── Valid status transitions ──────────────────────────────────────────────
 
-// ─── helpers ───────────────────────────────────────────────────────────────
+const VALID_TRANSITIONS = {
+  pending:          ['confirmed', 'cancelled'],
+  confirmed:        ['preparing', 'cancelled'],
+  preparing:        ['ready',     'cancelled'],
+  ready:            ['delivered'],
+  delivered:        [],
+  cancelled:        [],
+  // Legacy statuses for backward compat
+  new:              ['preparing', 'cancelled'],
+  awaiting_payment: ['pending'],
+}
+
+const ALL_STATUSES = ['pending', 'confirmed', 'preparing', 'ready', 'delivered', 'cancelled']
+
+// ─── Helpers ───────────────────────────────────────────────────────────────
 
 function makeOrderId() {
   return `ORD-${Date.now()}-${Math.random().toString(36).slice(2, 6).toUpperCase()}`
+}
+
+async function makeOrderNumber() {
+  const count = await Order.countDocuments()
+  return `#${1001 + count}`
 }
 
 function getRazorpay() {
@@ -23,108 +42,96 @@ function getRazorpay() {
   return new Razorpay({ key_id: keyId, key_secret: keySecret })
 }
 
-// ─── Seed demo orders (shown when dashboard first loads) ──────────────────
-
-function seedDemoOrders() {
-  const now = Date.now()
-  const seed = [
-    {
-      orderId: 'ORD-DEMO-001',
-      items: [
-        { id: 1, name: 'Butter Chicken', qty: 2, price: 320 },
-        { id: 2, name: 'Garlic Naan',    qty: 4, price: 45  },
-        { id: 3, name: 'Mango Lassi',    qty: 2, price: 95  },
-      ],
-      totalAmount: 1120, paymentMethod: 'cash', tableNumber: '4',
-      customerName: 'Rahul Sharma', customerPhone: '98765-43210', instructions: 'Less spicy please',
-      status: 'new', createdAt: new Date(now - 3 * 60000).toISOString(),
-    },
-    {
-      orderId: 'ORD-DEMO-002',
-      items: [
-        { id: 4, name: 'Paneer Tikka',   qty: 1, price: 280 },
-        { id: 5, name: 'Dal Makhani',    qty: 1, price: 220 },
-        { id: 6, name: 'Jeera Rice',     qty: 2, price: 140 },
-      ],
-      totalAmount: 780, paymentMethod: 'online', tableNumber: '7',
-      customerName: 'Priya Patel', customerPhone: '91234-56789', instructions: null,
-      status: 'preparing', createdAt: new Date(now - 12 * 60000).toISOString(),
-    },
-    {
-      orderId: 'ORD-DEMO-003',
-      items: [
-        { id: 7, name: 'Masala Dosa',    qty: 2, price: 160 },
-        { id: 8, name: 'Filter Coffee',  qty: 2, price: 60  },
-      ],
-      totalAmount: 440, paymentMethod: 'online', tableNumber: '2',
-      customerName: 'Arun Kumar', customerPhone: null, instructions: 'Extra sambar on the side',
-      status: 'ready', createdAt: new Date(now - 25 * 60000).toISOString(),
-    },
-    {
-      orderId: 'ORD-DEMO-004',
-      items: [
-        { id: 9, name: 'Chicken Biryani', qty: 1, price: 380 },
-        { id: 10, name: 'Raita',           qty: 1, price: 60  },
-      ],
-      totalAmount: 440, paymentMethod: 'cash', tableNumber: '11',
-      customerName: 'Meena Iyer', customerPhone: '99887-76655', instructions: null,
-      status: 'delivered', createdAt: new Date(now - 55 * 60000).toISOString(),
-    },
-    {
-      orderId: 'ORD-DEMO-005',
-      items: [
-        { id: 11, name: 'Veg Thali',      qty: 2, price: 250 },
-        { id: 12, name: 'Gulab Jamun',    qty: 4, price: 40  },
-      ],
-      totalAmount: 660, paymentMethod: 'cash', tableNumber: '5',
-      customerName: 'Vikram Nair', customerPhone: null, instructions: 'No onions please',
-      status: 'new', createdAt: new Date(now - 1 * 60000).toISOString(),
-    },
-  ]
-  seed.forEach(o => orders.set(o.orderId, o))
-  console.log('[orders] seeded', seed.length, 'demo orders')
+function makeHistory(status, timestamp, updatedBy = 'system') {
+  return { status, timestamp, updatedBy }
 }
-
-seedDemoOrders()
 
 // ─── GET /api/orders ── list all ──────────────────────────────────────────
 
-router.get('/', (req, res) => {
-  const all = Array.from(orders.values())
-    .sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt))
-  res.json(all)
+router.get('/', async (req, res) => {
+  try {
+    const all = await Order.find().sort({ createdAt: -1 }).lean()
+    res.json(all)
+  } catch (err) {
+    console.error('[orders] GET / error:', err.message)
+    res.status(500).json({ error: 'Failed to fetch orders' })
+  }
 })
 
 // ─── POST /api/orders ──────────────────────────────────────────────────────
 
 router.post('/', async (req, res) => {
-  const { items, totalAmount, paymentMethod, tableNumber, customerName, customerPhone, instructions } = req.body
+  const {
+    items,
+    // accept both field names
+    totalAmount: totalAmountField, total,
+    subtotal, gstAmount, gstBreakdown,
+    paymentMethod, tableNumber,
+    customerName, customerPhone,
+    specialInstructions, instructions,
+  } = req.body
+
+  const totalAmount = totalAmountField ?? total
+
   console.log(`[orders] POST / — method=${paymentMethod ?? 'razorpay'}, amount=${totalAmount}`)
 
-  if (!items?.length || !totalAmount) {
-    return res.status(400).json({ error: 'items and totalAmount are required' })
+  if (!items?.length) {
+    return res.status(400).json({ error: 'items are required' })
+  }
+  if (!totalAmount) {
+    return res.status(400).json({ error: 'total or totalAmount is required' })
+  }
+  if (!customerName?.trim()) {
+    return res.status(400).json({ error: 'customerName is required' })
   }
 
-  const orderId = makeOrderId()
+  // Normalise items: support both qty and quantity
+  const normalisedItems = items.map(item => ({
+    id:      item.id,
+    name:    item.name,
+    price:   item.price,
+    qty:     item.qty ?? item.quantity ?? 1,
+    gstRate: item.gstRate ?? 5,
+  }))
 
-  // ── Cash / Pay-at-Counter ──────────────────────────────────────────────
-  if (paymentMethod === 'cash') {
-    const order = {
-      orderId, items, totalAmount,
-      paymentMethod:  'cash',
-      tableNumber:    tableNumber ?? null,
-      customerName:   customerName ?? null,
-      customerPhone:  customerPhone ?? null,
-      instructions:   instructions ?? null,
-      status:         'new',
-      createdAt:      new Date().toISOString(),
+  const orderId     = makeOrderId()
+  const orderNumber = await makeOrderNumber()
+  const now         = new Date().toISOString()
+  const notes       = specialInstructions ?? instructions ?? null
+
+  // ── Cash / Counter / UPI — no Razorpay needed ─────────────────────────
+  const offlinePaymentMethods = ['cash', 'counter', 'upi']
+  if (offlinePaymentMethods.includes(paymentMethod)) {
+    try {
+      const order = await Order.create({
+        orderId, orderNumber,
+        items: normalisedItems,
+        subtotal: subtotal ?? null,
+        gstAmount: gstAmount ?? null,
+        gstBreakdown: gstBreakdown ?? [],
+        totalAmount, paymentMethod,
+        tableNumber:          tableNumber   ?? null,
+        customerName:         customerName.trim(),
+        customerPhone:        customerPhone ?? null,
+        specialInstructions:  notes,
+        status:               'pending',
+        statusHistory:        [makeHistory('pending', now)],
+        createdAt:            now,
+      })
+      console.log(`[orders] ${paymentMethod} order created: ${order.orderId} (${orderNumber})`)
+      return res.status(201).json({
+        success:     true,
+        orderId:     order._id.toString(),
+        orderNumber: order.orderNumber,
+        message:     'Order created successfully',
+      })
+    } catch (err) {
+      console.error('[orders] order create error:', err.message)
+      return res.status(500).json({ error: 'Failed to create order' })
     }
-    orders.set(orderId, order)
-    console.log(`[orders] cash order created: ${orderId}`)
-    return res.json({ orderId, paymentMethod: 'cash', status: 'new' })
   }
 
-  // ── Razorpay ────────────────────────────────────────────────────────────
+  // ── Razorpay (online) ──────────────────────────────────────────────────
   const amountPaise = Math.round(totalAmount * 100)
   let razorpayOrder
   try {
@@ -142,27 +149,39 @@ router.post('/', async (req, res) => {
     })
   }
 
-  orders.set(orderId, {
-    orderId, razorpayOrderId: razorpayOrder.id,
-    items, totalAmount, paymentMethod: 'online',
-    tableNumber:   tableNumber ?? null,
-    customerName:  customerName ?? null,
-    customerPhone: customerPhone ?? null,
-    instructions:  instructions ?? null,
-    status:        'awaiting_payment',
-    createdAt:     new Date().toISOString(),
-  })
-
-  res.json({
-    orderId, razorpayOrderId: razorpayOrder.id,
-    amount: amountPaise, currency: 'INR',
-    keyId: process.env.RAZORPAY_KEY_ID,
-  })
+  try {
+    const order = await Order.create({
+      orderId, orderNumber, razorpayOrderId: razorpayOrder.id,
+      items: normalisedItems,
+      subtotal: subtotal ?? null,
+      gstAmount: gstAmount ?? null,
+      gstBreakdown: gstBreakdown ?? [],
+      totalAmount, paymentMethod: 'online',
+      tableNumber:          tableNumber   ?? null,
+      customerName:         customerName.trim(),
+      customerPhone:        customerPhone ?? null,
+      specialInstructions:  notes,
+      status:               'awaiting_payment',
+      statusHistory:        [makeHistory('awaiting_payment', now)],
+      createdAt:            now,
+    })
+    res.json({
+      orderId:         order._id.toString(),
+      orderNumber:     order.orderNumber,
+      razorpayOrderId: razorpayOrder.id,
+      amount:          amountPaise,
+      currency:        'INR',
+      keyId:           process.env.RAZORPAY_KEY_ID,
+    })
+  } catch (err) {
+    console.error('[orders] save Razorpay order error:', err.message)
+    return res.status(500).json({ error: 'Failed to save order' })
+  }
 })
 
 // ─── POST /api/orders/verify ───────────────────────────────────────────────
 
-router.post('/verify', (req, res) => {
+router.post('/verify', async (req, res) => {
   const { razorpay_order_id, razorpay_payment_id, razorpay_signature, orderId } = req.body
   console.log(`[orders] verify — orderId=${orderId}`)
 
@@ -183,45 +202,115 @@ router.post('/verify', (req, res) => {
     return res.status(400).json({ error: 'Payment signature mismatch' })
   }
 
-  if (orderId && orders.has(orderId)) {
-    const order = orders.get(orderId)
-    orders.set(orderId, {
-      ...order,
-      status:    'new',
-      paymentId: razorpay_payment_id,
-      paidAt:    new Date().toISOString(),
-    })
-    console.log(`[orders] verified & ready for kitchen: ${orderId}`)
+  try {
+    const now   = new Date().toISOString()
+    const order = await Order.findOne({ orderId })
+    if (order) {
+      order.status        = 'pending'
+      order.paymentId     = razorpay_payment_id
+      order.paidAt        = now
+      order.statusHistory = [
+        ...(order.statusHistory ?? []),
+        makeHistory('pending', now),
+      ]
+      await order.save()
+      console.log(`[orders] verified & pending kitchen: ${orderId}`)
+    }
+  } catch (err) {
+    console.error('[orders] verify save error:', err.message)
   }
 
   res.json({ success: true })
 })
 
-// ─── PATCH /api/orders/:orderId ── update kitchen status ──────────────────
+// ─── PUT /api/orders/:orderId/status ── managed status update ─────────────
 
-router.patch('/:orderId', (req, res) => {
-  const { orderId } = req.params
-  const { status }  = req.body
-  const VALID = ['new', 'preparing', 'ready', 'delivered']
+router.put('/:orderId/status', async (req, res) => {
+  const { orderId }                     = req.params
+  const { status, updatedBy = 'admin' } = req.body
 
-  if (!VALID.includes(status)) {
-    return res.status(400).json({ error: `Invalid status. Must be one of: ${VALID.join(', ')}` })
+  if (!ALL_STATUSES.includes(status)) {
+    return res.status(400).json({ error: 'Invalid status', allowed: ALL_STATUSES })
   }
 
-  const order = orders.get(orderId)
-  if (!order) return res.status(404).json({ error: 'Order not found' })
+  try {
+    const order = await Order.findOne({ orderId })
+    if (!order) return res.status(404).json({ error: 'Order not found' })
 
-  orders.set(orderId, { ...order, status, updatedAt: new Date().toISOString() })
-  console.log(`[orders] ${orderId} → ${status}`)
-  res.json({ orderId, status })
+    const allowed = VALID_TRANSITIONS[order.status] ?? []
+    if (!allowed.includes(status)) {
+      return res.status(422).json({
+        error:   `Cannot transition from '${order.status}' to '${status}'`,
+        current: order.status,
+        allowed,
+      })
+    }
+
+    const now = new Date().toISOString()
+    order.status        = status
+    order.updatedAt     = now
+    order.statusHistory = [
+      ...(order.statusHistory ?? [makeHistory(order.status, order.createdAt)]),
+      makeHistory(status, now, updatedBy),
+    ]
+    await order.save()
+
+    console.log(`[orders] ${orderId}: → ${status} (by ${updatedBy})`)
+    res.json(order.toObject())
+  } catch (err) {
+    console.error('[orders] status update error:', err.message)
+    res.status(500).json({ error: 'Failed to update order status' })
+  }
 })
 
-// ─── GET /api/orders/:orderId ── single order ─────────────────────────────
+// ─── PATCH /api/orders/:orderId ── legacy kitchen status (backward compat) ─
 
-router.get('/:orderId', (req, res) => {
-  const order = orders.get(req.params.orderId)
-  if (!order) return res.status(404).json({ error: 'Order not found' })
-  res.json(order)
+router.patch('/:orderId', async (req, res) => {
+  const { orderId } = req.params
+  const { status }  = req.body
+  const LEGACY_VALID = ['pending', 'confirmed', 'preparing', 'ready', 'delivered', 'cancelled', 'new']
+
+  if (!LEGACY_VALID.includes(status)) {
+    return res.status(400).json({ error: `Invalid status. Must be one of: ${LEGACY_VALID.join(', ')}` })
+  }
+
+  try {
+    const order = await Order.findOne({ orderId })
+    if (!order) return res.status(404).json({ error: 'Order not found' })
+
+    const now = new Date().toISOString()
+    order.status        = status
+    order.updatedAt     = now
+    order.statusHistory = [
+      ...(order.statusHistory ?? [makeHistory(order.status, order.createdAt)]),
+      makeHistory(status, now, 'system'),
+    ]
+    await order.save()
+
+    console.log(`[orders] ${orderId} → ${status} (legacy PATCH)`)
+    res.json({ orderId, status })
+  } catch (err) {
+    console.error('[orders] legacy patch error:', err.message)
+    res.status(500).json({ error: 'Failed to update order' })
+  }
+})
+
+// ─── GET /api/orders/:id ── single order (by _id or orderId) ─────────────
+
+router.get('/:id', async (req, res) => {
+  const { id } = req.params
+  try {
+    // Try MongoDB ObjectId first, fall back to custom orderId
+    const isObjectId = /^[a-f\d]{24}$/i.test(id)
+    const order = isObjectId
+      ? await Order.findById(id).lean()
+      : await Order.findOne({ orderId: id }).lean()
+    if (!order) return res.status(404).json({ error: 'Order not found' })
+    res.json(order)
+  } catch (err) {
+    console.error('[orders] GET /:id error:', err.message)
+    res.status(500).json({ error: 'Failed to fetch order' })
+  }
 })
 
 module.exports = router
